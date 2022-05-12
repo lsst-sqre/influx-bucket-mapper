@@ -1,39 +1,32 @@
 #!/usr/bin/env python3
-import json
+import asyncio
 import os
-import requests
-
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import timedelta
-from typing import Any, List, Dict
+from typing import Any, Dict, List, Union
 
-### Some dataclasses to represent InfluxDB v2 objects
-### Unless otherwise specified, they can be found at:
-###      https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetBuckets
+import aiohttp
 
+# InfluxDB2 defaults
 
-@dataclass
-class Label:
-    """An InfluxDB Label."""
+DEFAULT_URL = "http://localhost:8086"
+DEFAULT_ORG = "default"
 
-    id: str = ""
-    name: str = ""
-    orgId: str = ""
-    properties: Dict[str, str] = field(default_factory=dict)
+# Simple typealiases to represent InfluxDB v2 object fields
+# Unless otherwise specified, they can be found at:
+#      https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetBuckets
+# "self" doesn't work as an object attribute, unsurprisingly.
+# The problem with "RetentionRule" appears to be in aiohttp unmarshalling.
 
+RetentionRule = Dict[str, Union[int, str]]
+"""An InfluxDB v2 RetentionRule.  Valid keys:
+* everySeconds: int
+* shardGroupDurationSeconds: int
+* type: str
+"""
 
-@dataclass
-class RetentionRule:
-    """An InfluxDB v2 RetentionRule."""
-
-    everySeconds: int
-    shardGroupDurationSeconds: int
-    type: str = "expire"
-
-
-
-BucketLinks = List[Dict[str,str]]
-"""Links for a Bucket object.  Valid keys:
+BucketLinks = List[Dict[str, str]]
+"""Links for a Bucket object.  Valid keys (all str):
 * labels
 * members
 * org
@@ -48,6 +41,20 @@ URILinks = List[Dict[str, str]]
 * next
 * prev
 """
+
+# Some dataclasses to represent InfluxDB v2 objects
+# Unless otherwise specified, they can be found at:
+#      https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetBuckets
+
+
+@dataclass
+class Label:
+    """An InfluxDB Label."""
+
+    id: str = ""
+    name: str = ""
+    orgId: str = ""
+    properties: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -101,41 +108,60 @@ class DBRPPost:
 class BucketMapper:
     """This is the class that does the work of querying InfluxDB v2 for its
     buckets, determining if buckets lack corresponding DBRPs, and creating
-    those if needed.
+    those if needed.  It is designed to be used as a context manager in an
+    ``async with`` clause.
+
+    It wants the same InfluxDBv2 environment variables as InfluxDBv2 or
+    Chronograf:
+    * INFLUXDB_TOKEN
+    * INFLUXDB_URL
+    * INFLUXDB_ORG
+
     """
 
-    def __init__(self) -> None:
-        self.token = os.getenv("INFLUX_TOKEN")
-        assert self.token, "INFLUX_TOKEN must be set"
-        self.url = os.getenv("INFLUXDB_URL") or "https://monitoring.lsst.codes"
-        self.api_url = self.url + "/api/v2"
-        self.org = os.getenv("INFLUXDB_ORG") or "square"
-        self.setup_session()
+    def __init__(
+        self,
+        token: str = os.getenv("INFLUXDB_TOKEN") or "",
+        url: str = os.getenv("INFLUXDB_URL") or DEFAULT_URL,
+        org: str = os.getenv("INFLUXDB_ORG") or DEFAULT_ORG,
+    ) -> None:
+        assert token, "INFLUXDB_TOKEN or token param must be set"
+        self.org = org
+        self.api_url = url + "/api/v2"
+        self.loop = asyncio.get_event_loop()
+        self.params = {"org": self.org}
+        self.session = aiohttp.ClientSession()
+        self.session.headers.update({"Authorization": f"Token {token}"})
 
-    def setup_session(self) -> None:
-        self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"Token {self.token}"})
-        self.session.params = {"org": self.org}
+    async def __aenter__(self):
+        return self
 
-    def list_buckets(self) -> List[BucketGet]:
+    async def __aexit__(self, *excinfo):
+        if self.session:
+            await self.session.close()
+
+    async def list_buckets(self) -> List[BucketGet]:
         next = f"{self.api_url}/buckets"
         b_list = []
         while next:
-            obj = self.session.get(next).json()
+            resp = await self.session.get(next, params=self.params)
+            obj = await resp.json()
             b_list.extend(obj["buckets"])
             next = ""
             if "links" in obj and "next" in obj["links"]:
                 next = obj["links"]["next"]
         return [BucketGet(**x) for x in b_list]
 
-    def list_dbrps(self) -> List[DBRPGet]:
-        def get_dbrp_page(uri: str) -> List[Dict[str, Any]]:
-            return self.session.get(uri).json()["content"]
+    async def list_dbrps(self) -> List[DBRPGet]:
+        async def get_dbrp_page(uri: str) -> List[Dict[str, Any]]:
+            resp = await self.session.get(uri, params=self.params)
+            obj = await resp.json()
+            return obj["content"]
 
-        d_list: List[Dict[str, Any]]
+        d_list: List[Dict[str, Any]] = []
         next = f"{self.api_url}/dbrps"
         while next:
-            obj = get_dbrp_page(next)
+            obj = await get_dbrp_page(next)
             if not obj:
                 break
             d_list.extend(obj)
@@ -144,13 +170,14 @@ class BucketMapper:
                 next = obj[-1]["links"]
         return [DBRPGet(**x) for x in d_list]
 
-    def prepare_buckets_without_dbrps(self) -> List[BucketGet]:
+    async def prepare_buckets_without_dbrps(self) -> List[BucketGet]:
         """Generate a list of buckets whose corresponding DBRPs are missing"""
-        buckets = self.list_buckets()
-        dbrps_ids = [x.bucketID for x in self.list_dbrps()]
-        return [x for x in buckets if x.id not in dbrps_ids]
+        buckets = await self.list_buckets()
+        dbrps_ids = [x.bucketID for x in await self.list_dbrps()]
+        missing_buckets = [x for x in buckets if x.id not in dbrps_ids]
+        return missing_buckets
 
-    def convert_bucket_to_dbrp(self, bucket: BucketGet) -> DBRPPost:
+    def make_dbrp_from_bucket(self, bucket: BucketGet) -> DBRPPost:
         """Given a bucket, construct a DBRP object for it."""
 
         def seconds_to_duration_literal(seconds: int) -> str:
@@ -163,7 +190,7 @@ class BucketMapper:
             if seconds == 0:
                 return "infinite"
             dls = ""
-            duration = timedelta(seconds)
+            duration = timedelta(seconds=seconds)
             if duration.days:
                 weeks = duration.days // 7
                 days = duration.days - weeks * 7
@@ -191,29 +218,52 @@ class BucketMapper:
             for r in rr:
                 # It's a list...I guess we use the first expire we find?
                 # Is it guaranteed to only have one?
-                if r.type != "expire":
+                if r["type"] != "expire":
                     continue
                 break
-            return seconds_to_duration_literal(r.everySeconds)
+            assert type(r["everySeconds"]) is int, "everySeconds is not an int"
+            return seconds_to_duration_literal(r["everySeconds"])
 
         return DBRPPost(
             bucketID=bucket.id,
             database=bucket.name,
             default=True,
             org=self.org,
-            retention_policy=get_retention_policy(bucket)
+            retention_policy=get_retention_policy(bucket),
         )
 
-    def prepare_new_dbrps(self) -> List[DBRPPost]:
+    async def prepare_new_dbrps(self) -> List[DBRPPost]:
         """Generate a list of DBRPs to create"""
+        # fmt: off
         return [
-            self.convert_bucket_to_dbrp(x)
-            for x in self.prepare_buckets_without_dbrps()
+            self.make_dbrp_from_bucket(x)
+            for x in await self.prepare_buckets_without_dbrps()
         ]
+        # fmt: on
+
+    async def create_new_dbrps(self) -> None:
+        """Create DBRPs in InfluxDB v2"""
+        dbrps = await self.prepare_new_dbrps()
+        payloads = [asdict(x) for x in dbrps]
+        # fmt: off
+        payload_futs = [
+            self.session.post(
+                self.api_url + "/dbrps",
+                json=x,
+                params=self.params)
+            for x in payloads]
+        # fmt: on
+        await asyncio.gather(*payload_futs)
+
 
 def main() -> None:
-    bm = BucketMapper()
-    print(bm.prepare_new_dbrps())
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(async_main())
+
+
+async def async_main() -> None:
+    async with BucketMapper() as bm:
+        await bm.create_new_dbrps()
 
 
 if __name__ == "__main__":
