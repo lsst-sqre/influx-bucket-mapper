@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+import json
+import os
+import requests
+
+from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import Any, List, Dict
+
+### Some dataclasses to represent InfluxDB v2 objects
+### Unless otherwise specified, they can be found at:
+###      https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetBuckets
+
+
+@dataclass
+class Label:
+    """An InfluxDB Label."""
+
+    id: str = ""
+    name: str = ""
+    orgId: str = ""
+    properties: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class RetentionRule:
+    """An InfluxDB v2 RetentionRule."""
+
+    everySeconds: int
+    shardGroupDurationSeconds: int
+    type: str = "expire"
+
+
+
+BucketLinks = List[Dict[str,str]]
+"""Links for a Bucket object.  Valid keys:
+* labels
+* members
+* org
+* owners
+* self
+* write
+"""
+
+URILinks = List[Dict[str, str]]
+"""Links for a paginated InfluxDB v2 object.  Valid keys:
+* self
+* next
+* prev
+"""
+
+
+@dataclass
+class BucketGet:
+    """An InfluxDB v2 Bucket, as returned from
+    https://docs.influxdata.com/influxdb/v2.2/api/#operation/GetBuckets
+    """
+
+    createdAt: str = ""
+    description: str = ""
+    id: str = ""
+    orgID: str = ""
+    updatedAt: str = ""
+    labels: list[Label] = field(default_factory=list)
+    links: list[BucketLinks] = field(default_factory=list)
+    name: str = ""
+    retentionRules: list[RetentionRule] = field(default_factory=list)
+    type: str = "user"
+
+
+@dataclass
+class DBRPGet:
+    """An InfluxDB v2 DBRP, as you'd receive it when listing them.
+    https://docs.influxdata.com/influxdb/cloud/api/#operation/GetDBRPs
+    """
+
+    bucketID: str
+    database: str
+    default: bool
+    id: str
+    orgID: str
+    retention_policy: str
+    links: list[URILinks] = field(default_factory=list)
+
+
+@dataclass
+class DBRPPost:
+    """An InfluxDB v2 DBRP, as you'd send it when creating one:
+    https://docs.influxdata.com/influxdb/cloud/api/#operation/PosttDBRPs
+
+    We assume you're going to use the org name rather than the orgID.
+    """
+
+    bucketID: str
+    database: str
+    org: str
+    retention_policy: str
+    default: bool = False
+
+
+class BucketMapper:
+    """This is the class that does the work of querying InfluxDB v2 for its
+    buckets, determining if buckets lack corresponding DBRPs, and creating
+    those if needed.
+    """
+
+    def __init__(self) -> None:
+        self.token = os.getenv("INFLUX_TOKEN")
+        assert self.token, "INFLUX_TOKEN must be set"
+        self.url = os.getenv("INFLUXDB_URL") or "https://monitoring.lsst.codes"
+        self.api_url = self.url + "/api/v2"
+        self.org = os.getenv("INFLUXDB_ORG") or "square"
+        self.setup_session()
+
+    def setup_session(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update({"Authorization": f"Token {self.token}"})
+        self.session.params = {"org": self.org}
+
+    def list_buckets(self) -> List[BucketGet]:
+        next = f"{self.api_url}/buckets"
+        b_list = []
+        while next:
+            obj = self.session.get(next).json()
+            b_list.extend(obj["buckets"])
+            next = ""
+            if "links" in obj and "next" in obj["links"]:
+                next = obj["links"]["next"]
+        return [BucketGet(**x) for x in b_list]
+
+    def list_dbrps(self) -> List[DBRPGet]:
+        def get_dbrp_page(uri: str) -> List[Dict[str, Any]]:
+            return self.session.get(uri).json()["content"]
+
+        d_list: List[Dict[str, Any]]
+        next = f"{self.api_url}/dbrps"
+        while next:
+            obj = get_dbrp_page(next)
+            if not obj:
+                break
+            d_list.extend(obj)
+            next = ""
+            if "links" in obj[-1] and "next" in obj[-1]["links"]:
+                next = obj[-1]["links"]
+        return [DBRPGet(**x) for x in d_list]
+
+    def prepare_buckets_without_dbrps(self) -> List[BucketGet]:
+        """Generate a list of buckets whose corresponding DBRPs are missing"""
+        buckets = self.list_buckets()
+        dbrps_ids = [x.bucketID for x in self.list_dbrps()]
+        return [x for x in buckets if x.id not in dbrps_ids]
+
+    def convert_bucket_to_dbrp(self, bucket: BucketGet) -> DBRPPost:
+        """Given a bucket, construct a DBRP object for it."""
+
+        def seconds_to_duration_literal(seconds: int) -> str:
+            """You'd really think this would be a library function already.
+
+            Weirdly, although InfluxDB v2 lets you specify this down to
+            nanoseconds, the object you get back from the API call only has
+            second precision.
+            """
+            if seconds == 0:
+                return "infinite"
+            dls = ""
+            duration = timedelta(seconds)
+            if duration.days:
+                weeks = duration.days // 7
+                days = duration.days - weeks * 7
+                if weeks:
+                    dls += f"{weeks}w"
+                if days:
+                    dls += f"{days}d"
+            if duration.seconds:
+                hours = duration.seconds // (60 * 60)
+                minutes = (duration.seconds - hours * 60 * 60) // 60
+                secs = (duration.seconds - hours * 60 * 60) - minutes * 60
+                if hours:
+                    dls += f"{hours}h"
+                if minutes:
+                    dls += f"{minutes}m"
+                if secs:
+                    dls += f"{secs}s"
+            return dls
+
+        def get_retention_policy(bucket: BucketGet) -> str:
+            """Construct a retention policy name from an expiration policy
+            on a bucket.
+            """
+            rr = bucket.retentionRules
+            for r in rr:
+                # It's a list...I guess we use the first expire we find?
+                # Is it guaranteed to only have one?
+                if r.type != "expire":
+                    continue
+                break
+            return seconds_to_duration_literal(r.everySeconds)
+
+        return DBRPPost(
+            bucketID=bucket.id,
+            database=bucket.name,
+            default=True,
+            org=self.org,
+            retention_policy=get_retention_policy(bucket)
+        )
+
+    def prepare_new_dbrps(self) -> List[DBRPPost]:
+        """Generate a list of DBRPs to create"""
+        return [
+            self.convert_bucket_to_dbrp(x)
+            for x in self.prepare_buckets_without_dbrps()
+        ]
+
+def main() -> None:
+    bm = BucketMapper()
+    print(bm.prepare_new_dbrps())
+
+
+if __name__ == "__main__":
+    main()
