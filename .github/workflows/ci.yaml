@@ -83,7 +83,7 @@ jobs:
           context: .
           push: true
           tags: |
-            lsstsqre/mobu:${{ steps.vars.outputs.tag }}
-            ghcr.io/lsst-sqre/mobu:${{ steps.vars.outputs.tag }}
+            lsstsqre/influx-bucket-mapper:${{ steps.vars.outputs.tag }}
+            ghcr.io/lsst-sqre/influx-bucket-mapper:${{ steps.vars.outputs.tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

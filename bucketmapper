@@ -9,8 +9,8 @@ import aiohttp
 
 # InfluxDB2 defaults
 
-DEFAULT_URL = "http://localhost:8086"
 DEFAULT_ORG = "default"
+DEFAULT_URL = "http://localhost:8086"
 
 # Simple typealiases to represent InfluxDB v2 object fields
 # Unless otherwise specified, they can be found at:
