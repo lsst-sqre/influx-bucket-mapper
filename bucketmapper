@@ -256,15 +256,10 @@ class BucketMapper:
         await asyncio.gather(*payload_futs)
 
 
-def main() -> None:
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(async_main())
-
-
-async def async_main() -> None:
+async def main() -> None:
     async with BucketMapper() as bm:
         await bm.create_new_dbrps()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
