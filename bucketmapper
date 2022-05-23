@@ -192,7 +192,7 @@ class BucketMapper:
         return dbrps
 
     async def prepare_buckets_without_dbrps(self) -> List[BucketGet]:
-        """Generate a list of buckets whose corresponding DBRPs are missing"""
+        """Generate a list of buckets without corresponding DBRPs."""
         buckets = await self.list_buckets()
         dbrps_ids = [x.bucketID for x in await self.list_dbrps()]
         missing_buckets = [x for x in buckets if x.id not in dbrps_ids]
@@ -203,7 +203,10 @@ class BucketMapper:
         """Given a bucket, construct a DBRP object for it."""
 
         def seconds_to_duration_literal(seconds: int) -> str:
-            """You'd really think this would be a library function already.
+            """Turn an integer number of seconds into an InfluxDB
+            duration literal.
+
+            You'd really think this would be a library function already.
 
             Weirdly, although InfluxDB v2 lets you specify this down to
             nanoseconds, the object you get back from the API call only has
@@ -255,7 +258,7 @@ class BucketMapper:
         )
 
     async def prepare_new_dbrps(self) -> List[DBRPPost]:
-        """Generate a list of DBRPs to create"""
+        """Generate a list of DBRPs to create."""
         # fmt: off
         new_dbrps = [
             self.make_dbrp_from_bucket(x)
@@ -266,7 +269,7 @@ class BucketMapper:
         return new_dbrps
 
     async def create_new_dbrps(self) -> None:
-        """Create DBRPs in InfluxDB v2"""
+        """Create DBRPs in InfluxDB v2."""
         dbrps = await self.prepare_new_dbrps()
         payloads = [asdict(x) for x in dbrps]
         self.log.debug(f"Creating DBRPS -> {payloads}")
