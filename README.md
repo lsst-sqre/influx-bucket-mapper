@@ -43,7 +43,8 @@ The only third-party Python library required is
 
 We also supply a [Dockerfile](./Dockerfile), which builds a container
 suitable for running as a Kubernetes CronJob (when supplied with the
-appropriate environment variables).
+appropriate environment variables).  The container can also be found in
+[Packages](./pkgs/container/influx-bucket-mapper).
 
 ## License
 
